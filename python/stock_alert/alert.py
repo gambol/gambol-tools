@@ -27,7 +27,7 @@ logging.basicConfig(level=logging.INFO,
                 format='%(asctime)s %(filename)s[line:%(lineno)d] %(levelname)s %(message)s',
                 datefmt='%a, %d %b %Y %H:%M:%S',
                 filename='myapp.log',
-                filemode='w')
+                filemode='a')
 
 def send_mail(subject,content):
     #使用MIMEText构造符合smtp协议的header及body  
@@ -38,8 +38,9 @@ def send_mail(subject,content):
 
     if not need_alert(subject):
         logging.info("no need alert. let it go")
-    else :
-        logging.info("go , alert. subject:" + subject)
+        return
+
+    logging.info("send mail alert. subject:" + subject)
 
     s = smtplib.SMTP_SSL("smtp.exmail.qq.com", port=465, timeout=30)#连接smtp邮件服务器,端口默认是25  
     # s.set_debuglevel(1) # 开启调试
@@ -51,7 +52,7 @@ def send_mail(subject,content):
 # 如果subject 以 [exchangeOpenAlert]开头,说明这个指标只有在开始期间才需要报警
 def need_alert(subject):
     if not subject.startswith("[exchangeOpenAlert]"):
-        return False
+        return True
 
     tz = pytz.timezone('America/New_York')
     now = datetime.datetime.now(tz)
