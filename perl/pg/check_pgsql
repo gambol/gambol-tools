@@ -1,0 +1,720 @@
+#!/usr/bin/perl
+use strict;
+use warnings;
+use Data::Dumper;
+
+use Getopt::Long;
+use File::Basename;
+use DBI;
+
+my $verbose;
+my $o = {
+    'verbose' => 0,
+    'port' => 5432,
+    'user' => 'mon',
+    'pwd' => 'pwd',
+    'db' => 'template1',
+    'streaming_threshold' => 100,
+    'streaming_check_method' => 'new',
+    'pgbouncer_threshold' => '5',
+    'help' => sub {  &usage && exit },
+};
+
+sub usage {
+    my $cmd = basename $0;
+
+    print <<__USAGE__;
+$cmd - nagios plugin for checking pgsql state
+Usage:  $cmd [options..]
+Options:
+        --help, --usage                     print This mesage
+        --verbose, -v                       Print more debug info (default: $o->{verbose} )
+
+        --host, -h                          Specify the host
+        --port, -p                          Specify the port (default: $o->{port} )
+        --db, -d                            Specify the database (default: $o->{db} )
+        --user, -u                          Specify the user, need superuser privileges (default: $o->{user} )
+        --pwd, -w                           Specify the password ( default: xxxxxx )
+
+        --streaming, -s                     Check streaming stat
+        --streaming_check_method, -sm       Specify streaming checking method , can be old or new (default: $o->{streaming_check_method} )
+        --streaming_application, -sa        Specify streaming application names, seperated by comma like -sa scrhad1,schrad2, or use many times like -sa schrad1 -sa schrad2
+        --streaming_ignore, -si             Specify streaming application names witch not check. use like -sa
+        --streaming_threshold, -st          Specify streaming sync threshold ( default: $o->{streaming_threshold} )
+
+        --slave_replay, -sr                 Check pg_last_xact_replay_timestamp on the slave and specify the threshold
+
+        --connection_count, -c              Check connections count and specify the threshold
+
+        --slow_query, -q                    Check slow query and specify the threshold
+
+        --slow_query_old, -qo               Check slow query before 9.1 and specify the threshold
+        
+        --slow_query_idle, -qi              Check idle_in_transaction query and specify the threshold
+
+        --slow_query_idle_only_old, -qioo   Check idle query before 9.1 and specify the threshold
+
+        --slow_query_idle_only_new, -qion   Check idle query after 9.1 and specify the threshold
+
+        --check_locks, -l                   Check locks
+
+        --check_qps, -qps                   Check qps
+
+        --pgbouncer, -b                     Check pgbouncer
+        --pgbouncer_threshold, -bt          Check pgbouncer cl_wait threshold ( default: $o->{pgbouncer_threshold} )
+__USAGE__
+}
+
+sub main {
+    GetOptions($o,
+        'verbose|v',
+        'host|h=s',
+        'port|p=s',
+        'db|d=s',
+        'user|u=s',
+        'pwd|w=s',
+        'streaming|s',
+        'streaming_check_method|sm=s',
+        'streaming_application|sa=s@',
+        'streaming_ignore|si=s@',
+        'streaming_threshold|st=i',
+        'slave_replay|sr=i',
+        'connection_count|c=i',
+        'slow_query|q=i',
+        'slow_query_old|qo=i',
+        'slow_query_idle|qi=i',
+        'slow_query_idle_only_old|qioo=i',
+        'slow_query_idle_only_new|qion=i',
+        'check_locks|l',
+        'check_qps|qps=i',
+        'pgbouncer|b',
+        'pgbouncer_threshold|bt=i',
+        'help|usage',
+    );
+
+    &checkStreaming if ( $o->{streaming} );
+    &checkSlaveReplay if ( $o->{slave_replay} );
+    &checkConnections if ( $o->{connection_count} );
+    &checkSlowQuery if ( $o->{slow_query} );
+    &checkSlowQueryOld if ( $o->{slow_query_old} );
+    &checkSlowQueryIdle if ( $o->{slow_query_idle} );
+    &checkSlowQueryIdleOnlyOld if ( $o->{slow_query_idle_only_old} );
+    &checkSlowQueryIdleOnlyNew if ( $o->{slow_query_idle_only_new} );
+    &checkLocks if ( $o->{check_locks} );
+    &checkQps if ( $o->{check_qps} );
+    &checkPgbouncer if ( $o->{pgbouncer} );
+}
+
+sub checkPgbouncer {
+    &argsCheck( 'host', 'port', 'db', 'user', 'pwd' );
+
+    my $dsn = sprintf( "DBI:Pg:database=%s;host=%s;port=%s",
+                        $o->{db}, $o->{host}, $o->{port} );
+
+    my $dbh = DBI->connect( $dsn, $o->{user}, $o->{pwd},
+                        {   RaiseError => 0,
+                             PrintError => 0,
+                        } );
+
+    &leave(DBI->errstr, 'crit') if not defined $dbh;
+    &leave($dbh->errstr, 'crit') if defined $dbh->errstr;
+    my $sql = qq/show pools;/;
+    $sql =~ s/\n//g;
+    my $r = $dbh->selectall_arrayref($sql);
+    my %info;
+    my @output;
+    my $max_cl_waiting = $o->{pgbouncer_threshold};
+    my $perfdata = 'pgbouncer: ';
+    for my $row ( @$r ) {
+        my ( $database, $user, $cl_active, $cl_waiting, $sv_active, $sv_idle, $sv_used, $sv_tested, $sv_login, $maxwait ) = @$row;
+        if ( $database ne 'pgbouncer' && $database ne 'postgres' ) {
+            $info{ $database } = {
+                cl_active => 0,
+                cl_waiting => 0,
+                sv_active => 0,
+                sv_idle => 0,
+                sv_used => 0,
+                sv_tested => 0,
+                sv_login => 0,
+                maxwait => 0
+            } if not defined $info{ $database };
+            $info{ $database }->{cl_active} += $cl_active;
+            $info{ $database }->{cl_waiting} += $cl_waiting;
+            $info{ $database }->{sv_active} += $sv_active;
+            $info{ $database }->{sv_idle} += $sv_idle;
+            $info{ $database }->{sv_used} += $sv_used;
+            $info{ $database }->{sv_tested} += $sv_tested;
+            $info{ $database }->{sv_login} += $sv_login;
+            $info{ $database }->{maxwait} += $maxwait;
+
+            if ( $cl_waiting >= $max_cl_waiting ) {
+                push @output, "$database cl_waiting $cl_waiting vs $max_cl_waiting";
+            }
+        }
+    }
+
+    for my $d ( keys %info ) {
+        $perfdata .= join ( ' ', map{ sprintf("%s_%s=%d", $d, $_, $info{$d}->{$_}) } keys %{$info{$d}} );
+    }
+
+    $dbh->disconnect;
+
+    if ( @output ) {
+        &leave( join(';', @output), 'crit', $perfdata);
+    } else {
+        &leave('ok', 'ok', $perfdata);
+    }
+}
+
+sub checkLocks {
+    &argsCheck( 'host', 'port', 'db', 'user', 'pwd' );
+
+    my $dsn = sprintf( "DBI:Pg:database=%s;host=%s;port=%s",
+                        $o->{db}, $o->{host}, $o->{port} );
+
+    my $dbh = DBI->connect( $dsn, $o->{user}, $o->{pwd},
+                        {   RaiseError => 0,
+                             PrintError => 0,
+                        } );
+
+    &leave(DBI->errstr, 'crit') if not defined $dbh;
+    &leave($dbh->errstr, 'crit') if defined $dbh->errstr;
+    my $sql = qq/
+        select
+            wait.pid,
+            wait.application_name,
+            wait.query as query,
+            granted.pid as waitfor_pid,
+            granted.transactionid as waitfor_transactionid,
+            granted.usename as waitfor_usename,
+            granted.client_addr as waitfor_client_addr,
+            granted.query as waitfor_query,
+	    granted.application_name as waitfor_application_name
+        from
+            (select
+                  a.query,
+                  b.pid,
+                  b.transactionid,
+                  a.application_name
+             from
+                  pg_stat_activity a,
+                  pg_locks b
+             where
+                  a.waiting = 't'
+                  and a.pid = b.pid
+                  and granted = 'f'
+                  and b.locktype = 'transactionid'
+            ) wait,
+            (select
+                b.pid,
+                b.usename,
+                b.client_addr,
+                b.backend_start,
+                b.query_start,
+                b.waiting,
+                b.query,
+                a.transactionid,
+		b.application_name
+            from
+                pg_locks a,
+                pg_stat_activity b
+            where
+                a.pid = b.pid
+                and a.granted = 't'
+                and a.locktype = 'transactionid'
+            ) granted
+        where
+            wait.transactionid = granted.transactionid
+    /;
+    $sql =~ s/\n//g;
+    my $r = $dbh->selectall_arrayref($sql);
+    my %info;
+    my @output;
+    for my $row ( @$r ) {
+        my ( $pid, $application_name, $query, $waitfor_pid, $waitfor_transactionid, $waitfor_usename, $waitfor_client_addr, $waitfor_query, $waitfor_appname ) = @$row;
+        $query =~ s/\r|\n| +/ /g;
+        $waitfor_query =~ s/\r|\n| +/ /g;
+        push @output, sprintf("pid: %s, application_name: %s, waitfor_pid: %s, waitfor_appname: %s, waitfor_transactionid: %s, waitfor_usename: %s, waitfor_client_addr: %s, query: [%s], waitfor_query: [%s]", $pid, $application_name, $waitfor_pid, $waitfor_appname, $waitfor_transactionid, $waitfor_usename, $waitfor_client_addr, $query, $waitfor_query );
+    }
+
+    $dbh->disconnect;
+    if ( scalar @$r > 0 ) {
+        &leave(sprintf("Locks on %s: %s", $o->{host}, join('; ', @output) ), 'crit');
+    } else {
+        &leave('ok', 'ok');
+    }
+}
+
+sub checkSlowQuery {
+    &argsCheck( 'host', 'port', 'db', 'user', 'pwd' );
+
+    my $dsn = sprintf( "DBI:Pg:database=%s;host=%s;port=%s",
+                        $o->{db}, $o->{host}, $o->{port} );
+
+    my $dbh = DBI->connect( $dsn, $o->{user}, $o->{pwd},
+                        {   RaiseError => 0,
+                             PrintError => 0,
+                        } );
+
+    &leave(DBI->errstr, 'crit') if not defined $dbh;
+    &leave($dbh->errstr, 'crit') if defined $dbh->errstr;
+    my $sql = qq/
+        select
+            pid,
+            waiting,
+            datname,
+            usename,
+            now() - backend_start as backend_conn_time,
+            now() - query_start as query_run_time,
+            query,
+            client_addr,
+            application_name,
+            state
+        from
+            pg_stat_activity
+        where
+            client_port is not null
+            and state <> 'idle'
+            and query !~* '^vacuum'
+            and query !~* '^analyze|^analyse'
+            and query !~* 'pg_start_backup|pg_stop_backup'
+            and query !~* '^refresh'
+            and application_name <> 'pg_reorg'
+            and ( application_name = 'psql' and query ~* '^COPY' ) = false
+            and ( application_name = 'pg_dump' and query ~* '^COPY' and usename = 'pgdba' ) = false
+            and query !~* '^CREATE  INDEX  CONCURRENTLY|^CREATE UNIQUE  INDEX  CONCURRENTLY|^DROP INDEX CONCURRENTLY'
+            and query !~* 'pg_sleep'
+            and now() - query_start > '$o->{slow_query} sec'
+    /;
+    $sql =~ s/\n//g;
+    my $r = $dbh->selectall_arrayref($sql);
+    my @output;
+    for my $row ( @$r ) {
+        my ( $pid, $waiting, $datname, $usename, $backend_conn_time, $query_run_time, $query, $ip, $appname, $state ) = @$row;
+        $query =~ s/\r|\n| +/ /g;
+        push @output, sprintf("ip: %s, datname: %s, usename: %s, pid: %s, appname: %s, state: %s, conn_time: %s, run_time: %s, query: [%s]", $ip, $datname, $usename, $pid, $appname, $state, $backend_conn_time, $query_run_time, $query );
+    }
+    $dbh->disconnect;
+    if ( scalar @$r > 0 ) {
+        &leave(sprintf("Slow query on %s: %s", $o->{host}, join('; ', @output) ), 'crit');
+    } else {
+        &leave('ok', 'ok');
+    }
+
+}
+
+sub checkSlowQueryOld {
+    &argsCheck( 'host', 'port', 'db', 'user', 'pwd' );
+
+    my $dsn = sprintf( "DBI:Pg:database=%s;host=%s;port=%s",
+                        $o->{db}, $o->{host}, $o->{port} );
+
+    my $dbh = DBI->connect( $dsn, $o->{user}, $o->{pwd},
+                        {   RaiseError => 0,
+                             PrintError => 0,
+                        } );
+
+    &leave(DBI->errstr, 'crit') if not defined $dbh;
+    &leave($dbh->errstr, 'crit') if defined $dbh->errstr;
+    my $sql = qq/
+       select
+            procpid,
+            waiting,
+            datname,
+            usename,
+            now() - backend_start as backend_conn_time,
+            now() - query_start as query_run_time,
+            current_query,
+            client_addr,
+            application_name,
+            'active' as state
+        from
+            pg_stat_activity
+        where
+            client_port is not null
+            and current_query !~* '^vacuum'
+            and current_query !~* '^analyze|^analyse'
+            and current_query !~* 'pg_start_backup|pg_stop_backup'
+            and application_name <> 'pg_reorg'
+            and ( application_name = 'psql' and current_query ~* '^COPY' ) = false
+            and ( application_name = 'pg_dump' and current_query ~* '^COPY' and usename = 'pgdba' ) = false
+            and current_query !~* '^CREATE  INDEX  CONCURRENTLY|^CREATE UNIQUE  INDEX  CONCURRENTLY|^DROP INDEX CONCURRENTLY'
+            and current_query !~* 'pg_sleep' and current_query not in ('<IDLE>', '<IDLE> in transaction', '<IDLE> in transaction (aborted)' );
+            and now() - query_start > '$o->{slow_query_old} sec'
+    /;
+    $sql =~ s/\n//g;
+    my $r = $dbh->selectall_arrayref($sql);
+    my @output;
+    for my $row ( @$r ) {
+        my ( $pid, $waiting, $datname, $usename, $backend_conn_time, $query_run_time, $query, $ip, $appname, $state ) = @$row;
+        $query =~ s/\r|\n| +/ /g;
+        push @output, sprintf("ip: %s, datname: %s, usename: %s, pid: %s, appname: %s, state: %s, conn_time: %s, run_time: %s, query: [%s]", $ip, $datname, $usename, $pid, $appname, $state, $backend_conn_time, $query_run_time, $query );
+    }
+    $dbh->disconnect;
+    if ( scalar @$r > 0 ) {
+        &leave(sprintf("Slow query on %s: %s", $o->{host}, join('; ', @output) ), 'crit');
+    } else {
+        &leave('ok', 'ok');
+    }
+
+}
+
+sub checkSlowQueryIdle {
+    &argsCheck( 'host', 'port', 'db', 'user', 'pwd' );
+
+    my $dsn = sprintf( "DBI:Pg:database=%s;host=%s;port=%s",
+                        $o->{db}, $o->{host}, $o->{port} );
+
+    my $dbh = DBI->connect( $dsn, $o->{user}, $o->{pwd},
+                        {   RaiseError => 0,
+                             PrintError => 0,
+                        } );
+
+    &leave(DBI->errstr, 'crit') if not defined $dbh;
+    &leave($dbh->errstr, 'crit') if defined $dbh->errstr;
+    my $sql = qq/
+        select
+            pid,
+            waiting,
+            datname,
+            usename,
+            now() - backend_start as backend_conn_time,
+            now() - query_start as query_run_time,
+            query,
+            client_addr,
+            application_name,
+            state,
+            pg_terminate_backend(pid) as terminated
+        from
+            pg_stat_activity
+        where
+            ( state = 'idle in transaction' or state = 'idle in transaction (aborted)')
+            and query !~* '^vacuum'
+            and query !~* '^analyze|^analyse'
+            and query !~* 'pg_start_backup|pg_stop_backup'
+            and now() - query_start > '$o->{slow_query_idle} sec'
+    /;
+    $sql =~ s/\n//g;
+    my $r = $dbh->selectall_arrayref($sql);
+    my @output;
+    for my $row ( @$r ) {
+        my ( $pid, $waiting, $datname, $usename, $backend_conn_time, $query_run_time, $query, $ip, $appname, $state, $terminated ) = @$row;
+        $query =~ s/\r|\n| +/ /g;
+        push @output, sprintf("ip: %s, datname: %s, usename: %s, pid: %s, appname: %s, state: %s, conn_time: %s, run_time: %s, terminated: %s, query: [%s]", $ip, $datname, $usename, $pid, $appname, $state, $backend_conn_time, $query_run_time, $terminated, $query );
+    }
+    $dbh->disconnect;
+    if ( scalar @$r > 0 ) {
+        &leave(sprintf("Slow query of idle in transaction on %s has been killed: %s", $o->{host}, join('; ', @output) ), 'crit');
+    } else {
+        &leave('ok', 'ok');
+    }
+
+}
+
+sub checkSlowQueryIdleOnlyOld {
+    &argsCheck( 'host', 'port', 'db', 'user', 'pwd' );
+
+    my $dsn = sprintf( "DBI:Pg:database=%s;host=%s;port=%s",
+                        $o->{db}, $o->{host}, $o->{port} );
+
+    my $dbh = DBI->connect( $dsn, $o->{user}, $o->{pwd},
+                        {   RaiseError => 0,
+                             PrintError => 0,
+                        } );
+
+    &leave(DBI->errstr, 'crit') if not defined $dbh;
+    &leave($dbh->errstr, 'crit') if defined $dbh->errstr;
+    my $sql = qq/
+        select 
+            procpid,
+            datname,
+            usename,
+            now() - backend_start as backend_conn_time,
+            now() - query_start as query_run_time,
+            current_query,
+            client_addr,
+            application_name,
+            'idle' as state,
+            pg_terminate_backend(procpid) as terminated
+        from
+            pg_stat_activity
+        where
+            current_query = '<IDLE>'
+            and now() - query_start > '$o->{slow_query_idle_only_old} sec'
+    /;
+    $sql =~ s/\n//g;
+    my $r = $dbh->selectall_arrayref($sql);
+    my @output;
+    for my $row ( @$r ) {
+        my ( $pid, $datname, $usename, $backend_conn_time, $query_run_time, $query, $ip, $appname, $state, $terminated ) = @$row;
+        $query =~ s/\r|\n| +/ /g;
+        push @output, sprintf("ip: %s, datname: %s, usename: %s, pid: %s, appname: %s, state: %s, conn_time: %s, run_time: %s, terminated: %s, query: [%s]", $ip, $datname, $usename, $pid, $appname, $state, $backend_conn_time, $query_run_time, $terminated, $query );
+    }
+    $dbh->disconnect;
+    if ( scalar @$r > 0 ) {
+        &leave(sprintf("Slow query of idle on %s has been killed: %s", $o->{host}, join('; ', @output) ), 'crit');
+    } else {
+        &leave('ok', 'ok');
+    }
+
+}
+
+sub checkSlowQueryIdleOnlyNew {
+    &argsCheck( 'host', 'port', 'db', 'user', 'pwd' );
+
+    my $dsn = sprintf( "DBI:Pg:database=%s;host=%s;port=%s",
+                        $o->{db}, $o->{host}, $o->{port} );
+
+    my $dbh = DBI->connect( $dsn, $o->{user}, $o->{pwd},
+                        {   RaiseError => 0,
+                             PrintError => 0,
+                        } );
+
+    &leave(DBI->errstr, 'crit') if not defined $dbh;
+    &leave($dbh->errstr, 'crit') if defined $dbh->errstr;
+    my $sql = qq/
+        select 
+            pid,
+            datname,
+            usename,
+            now() - backend_start as backend_conn_time,
+            now() - query_start as query_run_time,
+            query,
+            client_addr,
+            application_name,
+            state,
+            pg_terminate_backend(pid) as terminated
+        from
+            pg_stat_activity
+        where
+            state = 'idle'
+            and now() - query_start > '$o->{slow_query_idle_only_new} sec'
+    /;
+    $sql =~ s/\n//g;
+    my $r = $dbh->selectall_arrayref($sql);
+    my @output;
+    for my $row ( @$r ) {
+        my ( $pid, $datname, $usename, $backend_conn_time, $query_run_time, $query, $ip, $appname, $state, $terminated ) = @$row;
+        $query =~ s/\r|\n| +/ /g;
+        push @output, sprintf("ip: %s, datname: %s, usename: %s, pid: %s, appname: %s, state: %s, conn_time: %s, run_time: %s, terminated: %s, query: [%s]", $ip, $datname, $usename, $pid, $appname, $state, $backend_conn_time, $query_run_time, $terminated, $query );
+    }
+    $dbh->disconnect;
+    if ( scalar @$r > 0 ) {
+        &leave(sprintf("Slow query of idle on %s has been killed: %s", $o->{host}, join('; ', @output) ), 'crit');
+    } else {
+        &leave('ok', 'ok');
+    }
+
+}
+
+
+sub checkSlaveReplay {
+    &argsCheck( 'host', 'port', 'db', 'user', 'pwd' );
+
+    my $dsn = sprintf( "DBI:Pg:database=%s;host=%s;port=%s",
+                        $o->{db}, $o->{host}, $o->{port} );
+
+    my $dbh = DBI->connect( $dsn, $o->{user}, $o->{pwd},
+                        {   RaiseError => 0,
+                             PrintError => 0,
+                        } );
+
+    &leave(DBI->errstr, 'crit') if not defined $dbh;
+    &leave($dbh->errstr, 'crit') if defined $dbh->errstr;
+    my $sql = qq/
+        select
+            now() as now,
+            pg_last_xact_replay_timestamp() replay,
+            now() - pg_last_xact_replay_timestamp() as diff,
+            (select regexp_replace(a,E'primary_conninfo.+(hostaddr=\\\\d+.\\\\d+.\\\\d+.\\\\d+ ).*(port=\\\\d+).+',E'\\\\1\\\\2','ig') as master  from regexp_split_to_table(pg_read_file('recovery.conf'),E'\\\\n') t(a) where a ~ '^ *primary_conninfo')  
+        where
+            now() - pg_last_xact_replay_timestamp() > '$o->{slave_replay} sec'
+    /;
+    $sql =~ s/\n//g;
+    my $r = $dbh->selectall_arrayref($sql);
+    my @output;
+    for my $row ( @$r ) {
+        my ( $now, $replay_timestamp, $diff, $master ) = @$row;
+        push @output, sprintf("%s ! The Master is: %s." , $diff, $master);
+    }
+    $dbh->disconnect;
+    if ( scalar @$r > 0 ) {
+        &leave(sprintf("the time stamp diff of last transaction replayed on Salve Server host: %s and port: %s is %s", $o->{host}, $o->{port}, join('; ', @output) ), 'crit');
+    } else {
+        &leave('ok', 'ok');
+    }
+
+}
+
+sub checkQps {
+    &argsCheck( 'host', 'port', 'db', 'user', 'pwd' );
+
+    my $dsn = sprintf( "DBI:Pg:database=%s;host=%s;port=%s",
+                        $o->{db}, $o->{host}, $o->{port} );
+
+    my $dbh = DBI->connect( $dsn, $o->{user}, $o->{pwd},
+                        {   RaiseError => 0,
+                             PrintError => 0,
+                        } );
+
+    &leave(DBI->errstr, 'crit') if not defined $dbh;
+    &leave($dbh->errstr, 'crit') if defined $dbh->errstr;
+    my $sql = "select round( (c.sum - a.sum) / 10 ) as qps from (select sum(calls) from pg_stat_statements ) a join ( select pg_sleep(10) ) b on 1=1 join (select sum(calls) from pg_stat_statements ) c on 1=1";
+    my $r = $dbh->selectall_arrayref($sql);
+    my $count = $r->[0][0];
+    $dbh->disconnect;
+    if ( $count >= $o->{check_qps} ) {
+        &leave(sprintf("Too many query per second(qps) on host: %s and DB: %s [%s vs %s]", $o->{host}, $o->{db}, $count, $o->{check_qps} ), 'crit', "pg_qps_count=$count");
+    } else {
+        &leave(sprintf('ok [%s vs %s]', $count, $o->{check_qps} ), 'ok', "pg_qps_count=$count");
+    }
+}
+
+sub checkConnections {
+    &argsCheck( 'host', 'port', 'db', 'user', 'pwd' );
+
+    my $dsn = sprintf( "DBI:Pg:database=%s;host=%s;port=%s",
+                        $o->{db}, $o->{host}, $o->{port} );
+
+    my $dbh = DBI->connect( $dsn, $o->{user}, $o->{pwd},
+                        {   RaiseError => 0,
+                             PrintError => 0,
+                        } );
+
+    &leave(DBI->errstr, 'crit') if not defined $dbh;
+    &leave($dbh->errstr, 'crit') if defined $dbh->errstr;
+    my $sql = "select count(1) from pg_stat_activity";
+    my $r = $dbh->selectall_arrayref($sql);
+    my $count = $r->[0][0];
+    $dbh->disconnect;
+    if ( $count >= $o->{connection_count} ) {
+        &leave(sprintf("Too many connections on %s [%s vs %s]", $o->{host}, $count, $o->{connection_count} ), 'crit', "pg_connection_count=$count");
+    } else {
+        &leave(sprintf('ok [%s vs %s]', $count, $o->{connection_count} ), 'ok', "pg_connection_count=$count");
+    }
+}
+
+sub checkStreaming {
+    &argsCheck( 'host', 'port', 'db', 'user', 'pwd', 'streaming_threshold', 'streaming_application' );
+
+    my $dsn = sprintf( "DBI:Pg:database=%s;host=%s;port=%s",
+                        $o->{db}, $o->{host}, $o->{port} );
+
+    my $dbh = DBI->connect( $dsn, $o->{user}, $o->{pwd},
+                        {   RaiseError => 0,
+                             PrintError => 0,
+                        } );
+
+    &leave(DBI->errstr, 'crit') if not defined $dbh;
+    &leave($dbh->errstr, 'crit') if defined $dbh->errstr;
+
+    my @ignore;
+    for my $appName ( @{$o->{streaming_ignore} } ) {
+        foreach my $app ( split(/,/, $appName) ) {
+            push @ignore, "application_name != '$app'";
+        }
+    }
+
+    my $sql = qq{
+        select
+            application_name,
+            1 as current,
+            1 as replay,
+            pg_xlog_location_diff(pg_current_xlog_location(), replay_location) as diff
+        from
+            pg_stat_replication
+    };
+
+    if ( $o->{streaming_check_method} eq 'old' ) {
+        $sql = qq{
+            select
+                application_name,
+                regexp_replace(pg_current_xlog_location(), '^\\w+/', ''),
+                regexp_replace(replay_location, '^\\w+/', ''),
+                1 as dif
+            from
+                pg_stat_replication
+        };
+    }
+
+    $sql .= " where " . join(' and ', @ignore) if ( @ignore );
+
+    $sql =~ s/\n//g;
+    my $r = $dbh->selectall_arrayref($sql);
+    my %repHosts;
+    my @output;
+    my $exitCode = 0;
+    my $avgDiff = 0;
+    for ( @$r ) {
+        my ( $appName, $currentLocation, $replayLocation, $diff ) = @$_;
+
+        if ( $o->{streaming_check_method} eq 'old' ) {
+            $diff = hex($currentLocation) - hex($replayLocation);
+        }
+
+        $repHosts{ $appName } = 1;
+        if ( $diff >= $o->{streaming_threshold} ) {
+            push @output, sprintf("streaming location on $appName is to late as master[%s vs %s]", &prettySize($diff), &prettySize($o->{streaming_threshold}) );
+            $exitCode++;
+        }
+        $avgDiff += $diff;
+    }
+
+    $avgDiff = $avgDiff / scalar @$r if ( @$r );
+
+    $dbh->disconnect;
+
+    for my $appName ( @{$o->{streaming_application}} ) {
+        for my $app ( split(/,/, $appName) ) {
+            if ( not defined $repHosts{ $app } ) {
+                push @output, "streaming for $app not found, maybe disconnect from master";
+                $exitCode ++;
+            } else {
+                delete $repHosts{ $app };
+            }
+        }
+    }
+
+    if ( %repHosts ) {
+        push @output, sprintf("streaming for %s found, maybe you should add monitor for it", join(",", keys %repHosts) );
+        $exitCode ++;
+    }
+
+    push @output, "ok" if ( not @output );
+    &leave( join("; ", @output), $exitCode > 0 ? 'crit' : 'ok', "pg_replication_diff=$avgDiff" );
+
+}
+
+sub prettySize {
+    my @sizes=qw( B KB MB GB TB PB);
+    my $size = shift;
+    my $i = 0;
+
+    while ($size > 1024) {
+        $size = $size / 1024;
+        $i++;
+    }
+    #return sprintf("%.3f$sizes[$i]", $size);
+    return sprintf("%d %s", $size, $sizes[$i]);
+}
+
+sub argsCheck {
+    for my $key ( @_ ) {
+        if ( not defined $o->{$key} ) {
+            &usage && &leave( "$key should be specified", 'crit');
+        }
+    }
+}
+
+sub leave {
+    my ( $msg, $exitLevel, $perfData ) = @_;
+    my %level = (
+        'ok' => 0,
+        'warn' => 1,
+        'crit' => 2,
+    );
+    print $msg, defined $perfData ? " | $perfData " : '' , "\n";
+    exit $level{$exitLevel};
+}
+
+&main;
