@@ -15,9 +15,9 @@ import json
 import pytz
 import datetime
 
-_user = "owl@bbae.com"  
-_pwd  = "Anno@123qwe"  
-_to   = "zhenbao.zhou@alphayee.com"   # 要改成 ba@alphayee.com
+_user = "xxx@aaa.com"  
+_pwd  = "Axxxxe"  
+_to   = "zxxxxx@aaa.com"   # 要改成 ba@alphayee.com
 
 #_xignite_url = "http://globalholidays.xignite.com/xGlobalHolidays.json/IsExchangeOpenOnDate?Exchange=XNYS&Date=08/22/2016&_Token=DBEC7AE6E4C04ECEAE8F3F5F002D3C80&Username=jiawei.bao@jimu.com"
 _xignite_url = "http://globalholidays.xignite.com/xGlobalHolidays.json/IsExchangeOpenOnDate?Exchange=XNYS&_Token=DBEC7AE6E4C04ECEAE8F3F5F002D3C80&Username=jiawei.bao@jimu.com&Date="
